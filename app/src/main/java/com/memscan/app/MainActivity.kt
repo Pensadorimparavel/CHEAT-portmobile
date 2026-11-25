@@ -1,0 +1,152 @@
+package com.memscan.app
+
+import android.app.Activity
+import android.app.AlertDialog
+import android.os.Bundle
+import android.widget.*
+import java.io.File
+import java.util.concurrent.ConcurrentHashMap
+
+data class Proc(val pid: Int, val name: String) {
+    override fun toString() = "$pid  $name"
+}
+
+class MainActivity : Activity() {
+    private lateinit var procSpinner: Spinner
+    private lateinit var typeSpinner: Spinner
+    private lateinit var valueInput: EditText
+    private lateinit var status: TextView
+    private lateinit var list: ListView
+    private val types = listOf("Int32", "Int64", "Float", "Double")
+    private var shown = listOf<Long>()
+    private val frozen = ConcurrentHashMap<Long, String>()   // addr -> "tipo|valor"
+    @Volatile private var frozenPid = 0
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        super.onCreate(savedInstanceState)
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(24, 24, 24, 24)
+            fitsSystemWindows = true
+        }
+        procSpinner = Spinner(this)
+        typeSpinner = Spinner(this).apply {
+            adapter = ArrayAdapter(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, types)
+        }
+        valueInput = EditText(this).apply { hint = "Valor"; setSingleLine() }
+        status = TextView(this).apply { text = "Toque em Atualizar processos." }
+        list = ListView(this)
+
+        root.addView(button("Atualizar processos") { refreshProcs() })
+        root.addView(procSpinner)
+        root.addView(button("Testar acesso à memória") { probe() })
+        root.addView(typeSpinner)
+        root.addView(valueInput)
+        val row = LinearLayout(this)
+        row.addView(button("Primeira busca") { scan(true) }, LinearLayout.LayoutParams(0, -2, 1f))
+        row.addView(button("Busca seguinte") { scan(false) }, LinearLayout.LayoutParams(0, -2, 1f))
+        root.addView(row)
+        root.addView(button("Descongelar tudo") { frozen.clear(); toast("Descongelado") })
+        root.addView(status)
+        root.addView(list, LinearLayout.LayoutParams(-1, 0, 1f))
+        setContentView(root)
+
+        list.setOnItemClickListener { _, _, i, _ -> editDialog(shown[i]) }
+
+        Thread {
+            while (true) {
+                try {
+                    val pid = frozenPid
+                    if (pid != 0) for ((a, tv) in frozen) {
+                        val p = tv.split("|", limit = 2)
+                        NativeScanner.writeValue(pid, a, p[0].toInt(), p[1])
+                    }
+                    Thread.sleep(50)
+                } catch (_: Exception) {}
+            }
+        }.apply { isDaemon = true; start() }
+
+        refreshProcs()
+    }
+
+    private fun button(t: String, f: () -> Unit) = Button(this).apply {
+        text = t; isAllCaps = false; setOnClickListener { f() }
+    }
+    private fun toast(s: String) = Toast.makeText(this, s, Toast.LENGTH_SHORT).show()
+    private fun bg(f: () -> Unit) = Thread { f() }.start()
+    private fun ui(f: () -> Unit) = runOnUiThread { f() }
+    private fun pid(): Int? = (procSpinner.selectedItem as? Proc)?.pid
+    private fun type() = typeSpinner.selectedItemPosition
+
+    private fun refreshProcs() {
+        val me = android.os.Process.myUid()
+        val myPid = android.os.Process.myPid()
+        val out = mutableListOf<Proc>()
+        File("/proc").listFiles()?.forEach { d ->
+            val p = d.name.toIntOrNull() ?: return@forEach
+            if (p == myPid) return@forEach
+            try {
+                val uid = File("/proc/$p/status").useLines { ls ->
+                    ls.firstOrNull { it.startsWith("Uid:") }
+                        ?.split(Regex("\\s+"))?.getOrNull(1)?.toIntOrNull()
+                }
+                if (uid != me) return@forEach
+                val name = File("/proc/$p/cmdline").readText().substringBefore('\u0000')
+                out += Proc(p, name.ifEmpty { "?" })
+            } catch (_: Exception) {}
+        }
+        out.sortBy { it.pid }
+        procSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, out)
+        status.text = "${out.size} processos com o mesmo UID (escolha o do jogo)."
+    }
+
+    private fun probe() {
+        val p = pid() ?: return toast("Escolha um processo")
+        status.text = "Testando..."
+        bg { val r = NativeScanner.probe(p); ui { status.text = r } }
+    }
+
+    private fun scan(first: Boolean) {
+        val p = pid() ?: return toast("Escolha um processo")
+        val v = valueInput.text.toString().trim()
+        if (v.isEmpty()) return toast("Digite o valor")
+        val t = type()
+        status.text = "Buscando..."
+        bg {
+            val r = if (first) NativeScanner.firstScan(p, t, v) else NativeScanner.nextScan(p, t, v)
+            if (r < 0) {
+                ui { status.text = "Erro: " + NativeScanner.strerror((-r).toInt()) }
+            } else {
+                val addrs = NativeScanner.results(100)
+                val rows = addrs.map { "0x%X = %s".format(it, NativeScanner.readValue(p, it, t) ?: "?") }
+                ui {
+                    shown = addrs.toList()
+                    status.text = "$r resultados" + if (r > 100) " (mostrando 100)" else ""
+                    list.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, rows)
+                }
+            }
+        }
+    }
+
+    private fun editDialog(addr: Long) {
+        val p = pid() ?: return
+        val t = type()
+        val input = EditText(this).apply { hint = "Novo valor"; setSingleLine() }
+        AlertDialog.Builder(this)
+            .setTitle("0x%X".format(addr))
+            .setView(input)
+            .setPositiveButton("Gravar") { _, _ ->
+                val v = input.text.toString().trim()
+                bg {
+                    val r = NativeScanner.writeValue(p, addr, t, v)
+                    ui { toast(if (r > 0) "Gravado" else "Erro: " + NativeScanner.strerror((-r).toInt())) }
+                }
+            }
+            .setNeutralButton("Congelar") { _, _ ->
+                val v = input.text.toString().trim()
+                if (v.isNotEmpty()) { frozenPid = p; frozen[addr] = "$t|$v"; toast("Congelado") }
+            }
+            .setNegativeButton("Cancelar", null)
+            .show()
+    }
+}
