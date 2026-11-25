@@ -1,0 +1,7 @@
+cmake_minimum_required(VERSION 3.22.1)
+project(scanner)
+set(CMAKE_CXX_STANDARD 17)
+add_library(scanner SHARED scanner.cpp)
+target_link_options(scanner PRIVATE -Wl,-z,max-page-size=16384)
+find_library(log-lib log)
+target_link_libraries(scanner ${log-lib})
