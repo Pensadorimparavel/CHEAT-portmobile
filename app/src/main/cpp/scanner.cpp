@@ -10,6 +10,7 @@
 #include <vector>
 #include <algorithm>
 #include <mutex>
+#include <sys/uio.h>
 
 namespace {
 
@@ -47,6 +48,43 @@ int openMem(int pid, int flags) {
     char p[64];
     snprintf(p, sizeof p, "/proc/%d/mem", pid);
     return open(p, flags | O_CLOEXEC);
+}
+
+// Acesso à memória: /proc/<pid>/mem; se falhar no PRÓPRIO processo,
+// usa process_vm_readv/writev (o clonador pode bloquear /proc/self/mem).
+struct Mem {
+    int fd = -1;
+    int pid = 0;
+    bool vm = false;
+    int err = 0;
+    bool ok() const { return fd >= 0 || vm; }
+};
+
+Mem openMemory(int pid, int flags) {
+    Mem m;
+    m.pid = pid;
+    m.fd = openMem(pid, flags);
+    if (m.fd < 0) {
+        m.err = errno;
+        if (pid == getpid()) m.vm = true;
+    }
+    return m;
+}
+
+void closeMemory(Mem& m) { if (m.fd >= 0) close(m.fd); m.fd = -1; }
+
+ssize_t memRead(const Mem& m, void* buf, size_t n, uint64_t addr) {
+    if (m.fd >= 0) return pread64(m.fd, buf, n, (off64_t)addr);
+    iovec l{buf, n};
+    iovec r{(void*)(uintptr_t)addr, n};
+    return process_vm_readv(m.pid, &l, 1, &r, 1, 0);
+}
+
+ssize_t memWrite(const Mem& m, const void* buf, size_t n, uint64_t addr) {
+    if (m.fd >= 0) return pwrite64(m.fd, buf, n, (off64_t)addr);
+    iovec l{(void*)buf, n};
+    iovec r{(void*)(uintptr_t)addr, n};
+    return process_vm_writev(m.pid, &l, 1, &r, 1, 0);
 }
 
 // regioes rw que nao sao arquivo mapeado (heap, anon, etc.)
@@ -91,23 +129,25 @@ Java_com_memscan_app_NativeScanner_probe(JNIEnv* env, jclass, jint pid) {
     std::string out;
     auto regs = readRegions(pid);
     out += "Regioes rw (anon/heap): " + std::to_string(regs.size()) + "\n";
-    int fd = openMem(pid, O_RDONLY);
-    if (fd < 0) {
-        out += std::string("Abrir mem (leitura): FALHOU - ") + strerror(errno) + "\n";
-    } else {
+    out += std::string("Processo proprio: ") + (pid == getpid() ? "sim" : "nao") + "\n";
+    Mem m = openMemory(pid, O_RDONLY);
+    if (m.fd < 0) out += std::string("/proc/mem (leitura): FALHOU - ") + strerror(m.err) + "\n";
+    if (m.ok()) {
         int ok = 0, tried = 0;
         uint8_t b[8];
         for (auto& r : regs) {
             if (tried >= 50) break;
             tried++;
-            if (pread(fd, b, 8, (off_t)r.start) == 8) ok++;
+            if (memRead(m, b, 8, r.start) == 8) ok++;
         }
-        out += "Leitura: " + std::to_string(ok) + "/" + std::to_string(tried) + " regioes lidas\n";
-        close(fd);
+        out += std::string("Leitura via ") + (m.fd >= 0 ? "/proc/mem" : "process_vm_readv") +
+               ": " + std::to_string(ok) + "/" + std::to_string(tried) + " regioes\n";
+        closeMemory(m);
     }
-    int wfd = openMem(pid, O_RDWR);
-    if (wfd < 0) out += std::string("Abrir mem (escrita): FALHOU - ") + strerror(errno);
-    else { out += "Abrir mem (escrita): OK"; close(wfd); }
+    Mem w = openMemory(pid, O_RDWR);
+    if (w.fd >= 0) { out += "Abrir mem (escrita): OK"; closeMemory(w); }
+    else out += std::string("Abrir mem (escrita): FALHOU - ") + strerror(w.err) +
+                (w.vm ? " (vai usar process_vm_writev)" : "");
     return env->NewStringUTF(out.c_str());
 }
 
@@ -116,10 +156,10 @@ Java_com_memscan_app_NativeScanner_firstScan(JNIEnv* env, jclass, jint pid, jint
     uint8_t target[8];
     if (!parseValue(type, toStd(env, jval).c_str(), target)) return -EINVAL;
     int sz = typeSize(type);
-    int fd = openMem(pid, O_RDONLY);
-    if (fd < 0) return -errno;
+    Mem m = openMemory(pid, O_RDONLY);
+    if (!m.ok()) return -m.err;
     auto regs = readRegions(pid);
-    if (regs.empty()) { close(fd); return -ENOENT; }
+    if (regs.empty()) { closeMemory(m); return -ENOENT; }
 
     std::lock_guard<std::mutex> lk(g_mu);
     g_results.clear();
@@ -129,18 +169,18 @@ Java_com_memscan_app_NativeScanner_firstScan(JNIEnv* env, jclass, jint pid, jint
         for (uint64_t addr = r.start; addr < r.end; addr += CH) {
             size_t len = (size_t)std::min<uint64_t>(CH, r.end - addr);
             size_t want = (size_t)std::min<uint64_t>(len + 8, r.end - addr);
-            ssize_t n = pread(fd, buf.data(), want, (off_t)addr);
+            ssize_t n = memRead(m, buf.data(), want, addr);
             if (n < sz) continue;
             size_t limit = std::min<size_t>(len, (size_t)n - sz + 1);
             for (size_t i = 0; i < limit; i += 4) {
                 if (memcmp(buf.data() + i, target, sz) == 0) {
                     g_results.push_back(addr + i);
-                    if (g_results.size() >= MAX_RESULTS) { close(fd); return (jlong)g_results.size(); }
+                    if (g_results.size() >= MAX_RESULTS) { closeMemory(m); return (jlong)g_results.size(); }
                 }
             }
         }
     }
-    close(fd);
+    closeMemory(m);
     return (jlong)g_results.size();
 }
 
@@ -149,16 +189,16 @@ Java_com_memscan_app_NativeScanner_nextScan(JNIEnv* env, jclass, jint pid, jint 
     uint8_t target[8], cur[8];
     if (!parseValue(type, toStd(env, jval).c_str(), target)) return -EINVAL;
     int sz = typeSize(type);
-    int fd = openMem(pid, O_RDONLY);
-    if (fd < 0) return -errno;
+    Mem m = openMemory(pid, O_RDONLY);
+    if (!m.ok()) return -m.err;
 
     std::lock_guard<std::mutex> lk(g_mu);
     std::vector<uint64_t> keep;
     for (uint64_t a : g_results) {
-        if (pread(fd, cur, sz, (off_t)a) == sz && memcmp(cur, target, sz) == 0) keep.push_back(a);
+        if (memRead(m, cur, sz, a) == sz && memcmp(cur, target, sz) == 0) keep.push_back(a);
     }
     g_results.swap(keep);
-    close(fd);
+    closeMemory(m);
     return (jlong)g_results.size();
 }
 
@@ -174,12 +214,12 @@ Java_com_memscan_app_NativeScanner_results(JNIEnv* env, jclass, jint max) {
 
 JNIEXPORT jstring JNICALL
 Java_com_memscan_app_NativeScanner_readValue(JNIEnv* env, jclass, jint pid, jlong addr, jint type) {
-    int fd = openMem(pid, O_RDONLY);
-    if (fd < 0) return nullptr;
+    Mem m = openMemory(pid, O_RDONLY);
+    if (!m.ok()) return nullptr;
     uint8_t b[8];
     int sz = typeSize(type);
-    ssize_t n = pread(fd, b, sz, (off_t)addr);
-    close(fd);
+    ssize_t n = memRead(m, b, sz, (uint64_t)addr);
+    closeMemory(m);
     if (n != sz) return nullptr;
     return env->NewStringUTF(formatValue(type, b).c_str());
 }
@@ -188,12 +228,12 @@ JNIEXPORT jlong JNICALL
 Java_com_memscan_app_NativeScanner_writeValue(JNIEnv* env, jclass, jint pid, jlong addr, jint type, jstring jval) {
     uint8_t b[8];
     if (!parseValue(type, toStd(env, jval).c_str(), b)) return -EINVAL;
-    int fd = openMem(pid, O_RDWR);
-    if (fd < 0) return -errno;
+    Mem m = openMemory(pid, O_RDWR);
+    if (!m.ok()) return -m.err;
     int sz = typeSize(type);
-    ssize_t n = pwrite(fd, b, sz, (off_t)addr);
+    ssize_t n = memWrite(m, b, sz, (uint64_t)addr);
     int err = errno;
-    close(fd);
+    closeMemory(m);
     return n == sz ? (jlong)n : (jlong)-err;
 }
 
