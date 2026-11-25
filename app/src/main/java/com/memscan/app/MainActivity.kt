@@ -7,8 +7,8 @@ import android.widget.*
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
-data class Proc(val pid: Int, val name: String, val uid: Int, val mine: Boolean) {
-    override fun toString() = (if (mine) "★ " else "") + "$pid  uid=$uid  $name"
+data class Proc(val pid: Int, val name: String, val uid: Int, val mine: Boolean, val exe: String) {
+    override fun toString() = (if (mine) "★ " else "") + "$pid  uid=$uid  $name  [$exe]"
 }
 
 class MainActivity : Activity() {
@@ -79,8 +79,15 @@ class MainActivity : Activity() {
     private fun type() = typeSpinner.selectedItemPosition
 
     private fun refreshProcs() {
-        val me = android.os.Process.myUid()
-        val myPid = android.os.Process.myPid()
+        // O clonador falsifica Process.myUid(); o UID real vem do kernel
+        val me = try {
+            File("/proc/self/status").useLines { ls ->
+                ls.firstOrNull { it.startsWith("Uid:") }
+                    ?.split(Regex("\\s+"))?.getOrNull(1)?.toIntOrNull()
+            }
+        } catch (_: Exception) { null } ?: android.os.Process.myUid()
+        val myPid = try { File("/proc/self").canonicalFile.name.toInt() }
+            catch (_: Exception) { android.os.Process.myPid() }
         val out = mutableListOf<Proc>()
         var total = 0
         var unreadable = 0
@@ -96,7 +103,9 @@ class MainActivity : Activity() {
                 val name = try {
                     File("/proc/$p/cmdline").readText().substringBefore('\u0000')
                 } catch (_: Exception) { "" }
-                out += Proc(p, name.ifEmpty { "?" }, uid, uid == me)
+                val exe = try { File("/proc/$p/exe").canonicalPath.substringAfterLast('/') }
+                    catch (_: Exception) { "?" }
+                out += Proc(p, name.ifEmpty { "?" }, uid, uid == me, exe)
             } catch (_: Exception) { unreadable++ }
         }
         out.sortWith(compareByDescending<Proc> { it.mine }.thenBy { it.pid })
