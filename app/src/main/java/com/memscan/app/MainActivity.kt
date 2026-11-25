@@ -94,7 +94,7 @@ class MainActivity : Activity() {
                         ?.split(Regex("\\s+"))?.getOrNull(1)?.toIntOrNull()
                 } ?: -1
                 val name = try {
-                    File("/proc/$p/cmdline").readText().substringBefore('\\u0000')
+                    File("/proc/$p/cmdline").readText().substringBefore('\u0000')
                 } catch (_: Exception) { "" }
                 out += Proc(p, name.ifEmpty { "?" }, uid, uid == me)
             } catch (_: Exception) { unreadable++ }
