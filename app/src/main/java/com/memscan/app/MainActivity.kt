@@ -40,6 +40,7 @@ class MainActivity : Activity() {
         root.addView(button("Atualizar processos") { refreshProcs() })
         root.addView(procSpinner)
         root.addView(button("Testar acesso à memória") { probe() })
+        root.addView(button("Ver arquivos carregados") { modules() })
         root.addView(typeSpinner)
         root.addView(valueInput)
         val row = LinearLayout(this)
@@ -94,7 +95,6 @@ class MainActivity : Activity() {
         File("/proc").listFiles()?.forEach { d ->
             val p = d.name.toIntOrNull() ?: return@forEach
             total++
-            if (p == myPid) return@forEach
             try {
                 val uid = File("/proc/$p/status").useLines { ls ->
                     ls.firstOrNull { it.startsWith("Uid:") }
@@ -105,7 +105,8 @@ class MainActivity : Activity() {
                 } catch (_: Exception) { "" }
                 val exe = try { File("/proc/$p/exe").canonicalPath.substringAfterLast('/') }
                     catch (_: Exception) { "?" }
-                out += Proc(p, name.ifEmpty { "?" }, uid, uid == me, exe)
+                val label = if (p == myPid) "(MemScan) $name" else name
+                out += Proc(p, label.ifEmpty { "?" }, uid, uid == me, exe)
             } catch (_: Exception) { unreadable++ }
         }
         out.sortWith(compareByDescending<Proc> { it.mine }.thenBy { it.pid })
@@ -113,6 +114,26 @@ class MainActivity : Activity() {
         status.text = "Meu UID: $me | PID: $myPid\n" +
             "Entradas em /proc: $total | ilegíveis: $unreadable\n" +
             "Listados: ${out.size} | com meu UID (★): ${out.count { it.mine }}"
+    }
+
+    private fun modules() {
+        val p = pid() ?: return toast("Escolha um processo")
+        bg {
+            val skip = listOf("/system", "/apex", "/vendor", "/dev", "/proc", "/product", "/odm")
+            val txt = try {
+                File("/proc/$p/maps").readLines()
+                    .mapNotNull { l -> val i = l.indexOf('/'); if (i < 0) null else l.substring(i).trim() }
+                    .filter { f -> skip.none { f.startsWith(it) } }
+                    .distinct().take(60).joinToString("\n")
+            } catch (e: Exception) { "Erro: ${e.message}" }
+            ui {
+                AlertDialog.Builder(this)
+                    .setTitle("Arquivos carregados (pid $p)")
+                    .setMessage(txt.ifEmpty { "(nada além do sistema)" })
+                    .setPositiveButton("OK", null)
+                    .show()
+            }
+        }
     }
 
     private fun probe() {
