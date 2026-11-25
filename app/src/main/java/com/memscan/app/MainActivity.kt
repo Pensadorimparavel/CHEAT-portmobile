@@ -7,8 +7,8 @@ import android.widget.*
 import java.io.File
 import java.util.concurrent.ConcurrentHashMap
 
-data class Proc(val pid: Int, val name: String) {
-    override fun toString() = "$pid  $name"
+data class Proc(val pid: Int, val name: String, val uid: Int, val mine: Boolean) {
+    override fun toString() = (if (mine) "★ " else "") + "$pid  uid=$uid  $name"
 }
 
 class MainActivity : Activity() {
@@ -82,22 +82,28 @@ class MainActivity : Activity() {
         val me = android.os.Process.myUid()
         val myPid = android.os.Process.myPid()
         val out = mutableListOf<Proc>()
+        var total = 0
+        var unreadable = 0
         File("/proc").listFiles()?.forEach { d ->
             val p = d.name.toIntOrNull() ?: return@forEach
+            total++
             if (p == myPid) return@forEach
             try {
                 val uid = File("/proc/$p/status").useLines { ls ->
                     ls.firstOrNull { it.startsWith("Uid:") }
                         ?.split(Regex("\\s+"))?.getOrNull(1)?.toIntOrNull()
-                }
-                if (uid != me) return@forEach
-                val name = File("/proc/$p/cmdline").readText().substringBefore('\u0000')
-                out += Proc(p, name.ifEmpty { "?" })
-            } catch (_: Exception) {}
+                } ?: -1
+                val name = try {
+                    File("/proc/$p/cmdline").readText().substringBefore('\\u0000')
+                } catch (_: Exception) { "" }
+                out += Proc(p, name.ifEmpty { "?" }, uid, uid == me)
+            } catch (_: Exception) { unreadable++ }
         }
-        out.sortBy { it.pid }
+        out.sortWith(compareByDescending<Proc> { it.mine }.thenBy { it.pid })
         procSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, out)
-        status.text = "${out.size} processos com o mesmo UID (escolha o do jogo)."
+        status.text = "Meu UID: $me | PID: $myPid\n" +
+            "Entradas em /proc: $total | ilegíveis: $unreadable\n" +
+            "Listados: ${out.size} | com meu UID (★): ${out.count { it.mine }}"
     }
 
     private fun probe() {
