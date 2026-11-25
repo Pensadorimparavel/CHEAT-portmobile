@@ -80,40 +80,23 @@ class MainActivity : Activity() {
     private fun type() = typeSpinner.selectedItemPosition
 
     private fun refreshProcs() {
-        // O clonador falsifica Process.myUid(); o UID real vem do kernel
+        // Diagnostico restrito ao proprio processo do MemScan.
         val me = try {
             File("/proc/self/status").useLines { ls ->
                 ls.firstOrNull { it.startsWith("Uid:") }
                     ?.split(Regex("\\s+"))?.getOrNull(1)?.toIntOrNull()
             }
         } catch (_: Exception) { null } ?: android.os.Process.myUid()
-        val myPid = try { File("/proc/self").canonicalFile.name.toInt() }
-            catch (_: Exception) { android.os.Process.myPid() }
-        val out = mutableListOf<Proc>()
-        var total = 0
-        var unreadable = 0
-        File("/proc").listFiles()?.forEach { d ->
-            val p = d.name.toIntOrNull() ?: return@forEach
-            total++
-            try {
-                val uid = File("/proc/$p/status").useLines { ls ->
-                    ls.firstOrNull { it.startsWith("Uid:") }
-                        ?.split(Regex("\\s+"))?.getOrNull(1)?.toIntOrNull()
-                } ?: -1
-                val name = try {
-                    File("/proc/$p/cmdline").readText().substringBefore('\u0000')
-                } catch (_: Exception) { "" }
-                val exe = try { File("/proc/$p/exe").canonicalPath.substringAfterLast('/') }
-                    catch (_: Exception) { "?" }
-                val label = if (p == myPid) "(MemScan) $name" else name
-                out += Proc(p, label.ifEmpty { "?" }, uid, uid == me, exe)
-            } catch (_: Exception) { unreadable++ }
-        }
-        out.sortWith(compareByDescending<Proc> { it.mine }.thenBy { it.pid })
-        procSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, out)
-        status.text = "Meu UID: $me | PID: $myPid\n" +
-            "Entradas em /proc: $total | ilegíveis: $unreadable\n" +
-            "Listados: ${out.size} | com meu UID (★): ${out.count { it.mine }}"
+        val myPid = android.os.Process.myPid()
+        val name = try {
+            File("/proc/self/cmdline").readText().substringBefore('\u0000')
+        } catch (_: Exception) { packageName }
+        val exe = try { File("/proc/self/exe").canonicalPath.substringAfterLast('/') }
+            catch (_: Exception) { "?" }
+        val own = Proc(myPid, "(MemScan) $name", me, true, exe)
+        procSpinner.adapter = ArrayAdapter(this, android.R.layout.simple_spinner_dropdown_item, listOf(own))
+        status.text = "Diagnostico do proprio app\nMeu UID: $me | PID: $myPid\n" +
+            "Processos de terceiros nao sao enumerados nem consultados."
     }
 
     private fun modules() {
